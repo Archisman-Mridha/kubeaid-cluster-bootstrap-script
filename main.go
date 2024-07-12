@@ -3,63 +3,39 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
-	"os/exec"
 	"time"
-
-	"github.com/charmbracelet/log"
 )
 
-type (
-	Config struct {
-		Git struct {
-			Username string `yaml:"username"`
+type Config struct {
+	Git struct {
+		Username string `yaml:"username"`
 
-			Password        string `yaml:"password"`
-			SSHPrivateKey   string `yaml:"sshPrivateKey"`
-			UseSSHAgentAuth bool   `yaml:"useSSHAgentAuth"`
-		} `yaml:"git"`
+		Password        string `yaml:"password"`
+		SSHPrivateKey   string `yaml:"sshPrivateKey"`
+		UseSSHAgentAuth bool   `yaml:"useSSHAgentAuth"`
+	} `yaml:"git"`
 
-		KubeaidRepoURL       string `yaml:"kubeaidRepoURL"`
-		KubeaidConfigRepoURL string `yaml:"kubeaidConfigRepoURL"`
+	KubeaidRepoURL       string `yaml:"kubeaidRepoURL"`
+	KubeaidConfigRepoURL string `yaml:"kubeaidConfigRepoURL"`
 
-		ClusterName string `yaml:"clusterName"`
+	ClusterName string `yaml:"clusterName"`
 
-		ArgoCD struct {
-			RepoName      string `yaml:"repoName"`
-			RepoType      string `yaml:"repoType"`
-			RepoUsername  string `yaml:"repoUsername"`
-			RepoAuthToken string `yaml:"repoAuthToken"`
-		} `yaml:"argoCD"`
+	ArgoCD struct {
+		RepoName      string `yaml:"repoName"`
+		RepoType      string `yaml:"repoType"`
+		RepoUsername  string `yaml:"repoUsername"`
+		RepoAuthToken string `yaml:"repoAuthToken"`
+	} `yaml:"argoCD"`
 
-		KubePrometheusVersion string `yaml:"kubePrometheusVersion"`
-		GrafanaURL            string `yaml:"grafanaURL"`
-		ConnectObmondo        bool   `yaml:"connectObmondo"`
+	KubePrometheusVersion string `yaml:"kubePrometheusVersion"`
+	GrafanaURL            string `yaml:"grafanaURL"`
+	ConnectObmondo        bool   `yaml:"connectObmondo"`
 
-		ManagementClusterKubeconfig string `yaml:"managementClusterKubeconfig"`
-	}
-
-	ArgocdAppTemplateValues struct {
-		ClusterName,
-		KubeAidRepo,
-		KubeAidConfigRepo,
-		Branch string
-	}
-
-	JsonnetFileTemplateValues struct {
-		ConnectObmondo        bool
-		KubePrometheusVersion string
-		GrafanaURL            string
-	}
-
-	SealedSecretArgocdRepoCredentialsTemplateValues struct {
-		Name     string
-		Password string
-		Type     string
-		URL      string
-		Username string
-	}
-)
+	ManagementClusterKubeconfig string `yaml:"managementClusterKubeconfig"`
+	ManagementClusterKubectx    string `yaml:"managementClusterKubectx"`
+}
 
 var (
 	currentTime = time.Now().Unix()
@@ -68,33 +44,38 @@ var (
 	repoDir     = tempDirPath + "/kubeaid-config"
 
 	config Config
-
-	defaultArgocdApps = []string{
-		"root",
-		"argo-cd",
-		"cilium",
-		"cluster-api",
-		"kube-prometheus",
-		"sealed-secrets",
-		"traefik",
-	}
 )
 
 func main() {
 	// Delete the temp dir after the script finishes running.
 	defer os.RemoveAll(tempDirPath)
 
-	log.SetLevel(log.DebugLevel)
-
-	log.Infof("💫 Running the kubeaid cluster bootstrap script")
-
-	// Declare and parse CLI flags.
 	configFile := flag.String("config-file", "", "Path to the YAML config file")
 	flag.Parse()
 
+	log.Printf("💫 Running the kubeaid cluster bootstrap script")
+
+	// Ensure CLI tools are installed.
+	ensurePrerequisitesInstalled()
+
+	// Parse CLI flags.
 	parseConfigFile(configFile)
 
+	// Detect git authentication method.
 	gitAuthMethod := getGitAuthMethod()
+
+	// Use specified kube-context.
+	log.Printf("⚙️ Setting context to %s in kubeconfig at %s", config.ManagementClusterKubectx, config.ManagementClusterKubectx)
+	kubectlConfigCmd := parseCommand(fmt.Sprintf(
+		"kubectl config use-context %s --kubeconfig %s",
+		config.ManagementClusterKubectx, config.ManagementClusterKubeconfig,
+	))
+	log.Printf("Executing command : %v", kubectlConfigCmd)
+	output, err := kubectlConfigCmd.CombinedOutput()
+	if err != nil {
+		log.Fatalf("❌ Failed setting context to %s in the kubeconfig at %s", config.ManagementClusterKubectx, config.ManagementClusterKubectx)
+	}
+	log.Println(string(output))
 
 	// Clone kubeaid-config repo.
 	repo := gitCloneRepo(config.KubeaidConfigRepoURL, repoDir, gitAuthMethod)
@@ -103,7 +84,7 @@ func main() {
 	// Create and checkout to a new branch.
 	repoWorktree, err := repo.Worktree()
 	if err != nil {
-		log.Fatal("Failed getting kubeaid-config repo worktree")
+		log.Fatal("❌ Failed getting kubeaid-config repo worktree")
 	}
 	branch := fmt.Sprintf("kubeaid-%s-%d", config.ClusterName, currentTime)
 	createAndCheckoutToBranch(repo, branch, repoWorktree)
@@ -111,8 +92,10 @@ func main() {
 	// In the k8s dir, we will create a folder for the cluster. Files related to the cluster, will
 	// be generated in this folder.
 	clusterDir := fmt.Sprintf("%s/k8s/%s", repoDir, config.ClusterName)
-	if _, err := os.Stat(clusterDir); !os.IsNotExist(err) {
-		log.Fatalf("Cluster dir %s already exists", clusterDir)
+	if _, err := os.Stat(clusterDir); os.IsNotExist(err) {
+		log.Fatalf("❌ Cluster dir %s already exists", clusterDir)
+	} else if err != nil {
+		log.Fatalf("Failed determining whether cluster-dir exists or not : %v", err)
 	}
 
 	// Generate files for ArgoCD apps and build kube-prometheus.
@@ -137,17 +120,14 @@ func main() {
 	// kubectl apply the root ArgoCD app.
 	// NOTE: not using client-go lib on purpose, since we only need to kubectl apply 1 file.
 	rootArgocdAppFilePath := fmt.Sprintf("%s/argocd-apps/templates/root.yaml", clusterDir)
-	kubectlApplyCmd := exec.Command(
-		"kubectl", "apply",
-		"-f", rootArgocdAppFilePath,
-		"--kubeconfig", config.ManagementClusterKubeconfig,
-	)
-	log.Debug("Executing command : %v", kubectlApplyCmd)
-	output, err := kubectlApplyCmd.CombinedOutput()
+	kubectlApplyCmd := parseCommand(fmt.Sprintf(
+		"kubectl apply -f %s --kubeconfig %s", rootArgocdAppFilePath, config.ManagementClusterKubeconfig))
+	log.Printf("Executing command : %v", kubectlApplyCmd)
+	output, err = kubectlApplyCmd.CombinedOutput()
 	if err != nil {
-		log.Fatalf("Failed kubectl applying the root ArgoCD app : %v", err)
+		log.Fatalf("❌ Failed kubectl applying the root ArgoCD app : %v", err)
 	}
-	log.Debugf("Output of kubectl applying the root argocd app : %v", output)
+	log.Print(string(output))
 
-	log.Infof("💫 Finished running the kubeaid cluster bootstrap script")
+	log.Printf("💫 Finished running the kubeaid cluster bootstrap script")
 }
