@@ -1,0 +1,28 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cilium
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cilium
+  project: default
+  sources:
+    - repoURL: {{.KubeAidRepo}}
+      path: argocd-helm-charts/cilium
+      targetRevision: HEAD
+      helm:
+        valueFiles:
+          - $values/k8s/{{.ClusterName}}/argocd-apps/values-cilium.yaml
+    - repoURL: {{.KubeAidConfigRepo}}
+      targetRevision: HEAD
+      ref: values
+  syncPolicy:
+    automated: {}
+    syncOptions:
+      - ApplyOutOfSyncOnly=true
+      - CreateNamespace=true
+

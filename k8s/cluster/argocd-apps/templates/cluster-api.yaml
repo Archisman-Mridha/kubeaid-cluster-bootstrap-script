@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cluster-api
+  namespace: argocd
+spec:
+  project: default
+  destination:
+    namespace: cluster-api
+    server: 'https://kubernetes.default.svc'
+  sources:
+    - repoURL: {{.KubeAidRepo}}
+      path: argocd-helm-charts/cluster-api
+      targetRevision: HEAD
+      helm:
+        valueFiles:
+          - $values/k8s/{{.ClusterName}}/argocd-apps/values-cluster-api.yaml
+    - repoURL: {{.KubeAidConfigRepo}}
+      targetRevision: HEAD
+      ref: values
+  syncPolicy:
+    automated: {}
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
